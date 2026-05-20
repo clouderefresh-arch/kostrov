@@ -360,7 +360,7 @@ def build_introduction(doc: Document) -> None:
 
 
 def build_chapter(doc: Document, ch_no: int, ch_title: str, sections: list[tuple[str, str, list]]) -> None:
-    add_heading1(doc, f'Глава {ch_no} {ch_title}')
+    add_heading1(doc, f'Глава {ch_no}. {ch_title}')
     for sec_no, sec_title, blocks in sections:
         add_heading2(doc, f'{sec_no} {sec_title}')
         for block in blocks:
