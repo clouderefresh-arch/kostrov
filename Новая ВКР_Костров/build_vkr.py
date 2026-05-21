@@ -13,10 +13,28 @@ from pathlib import Path
 
 from docx import Document
 from docx.enum.section import WD_SECTION
-from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING, WD_TAB_ALIGNMENT, WD_TAB_LEADER
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn, nsmap
 from docx.shared import Cm, Mm, Pt, RGBColor
+
+# Глобальные счётчик закладок и реестр заголовков (текст → имя закладки)
+_BM_ID = [1000]
+_BOOKMARKS: dict[str, str] = {}
+
+
+def _next_bm_id() -> int:
+    _BM_ID[0] += 1
+    return _BM_ID[0]
+
+
+def _bm_name(prefix: str) -> str:
+    """Возвращает безопасное для Word имя закладки."""
+    import re
+    name = re.sub(r'[^A-Za-z0-9_]', '_', prefix)
+    if not name or name[0].isdigit():
+        name = '_' + name
+    return name[:40]
 
 from vkr_content import CONTENT  # длинный контент в отдельном файле для читаемости
 
@@ -144,19 +162,38 @@ def page_break(doc: Document) -> None:
     run._element.append(br)
 
 
-def add_heading1(doc: Document, text: str, *, all_caps: bool = True) -> None:
+def _wrap_with_bookmark(paragraph, bookmark_name: str) -> None:
+    """Оборачивает содержимое параграфа парой bookmarkStart/bookmarkEnd."""
+    bm_id = _next_bm_id()
+    bm_start = OxmlElement('w:bookmarkStart')
+    bm_start.set(qn('w:id'), str(bm_id))
+    bm_start.set(qn('w:name'), bookmark_name)
+    bm_end = OxmlElement('w:bookmarkEnd')
+    bm_end.set(qn('w:id'), str(bm_id))
+    # вставляем bookmarkStart перед первым ребёнком, bookmarkEnd — после всего
+    paragraph._element.insert(0, bm_start)
+    paragraph._element.append(bm_end)
+
+
+def add_heading1(doc: Document, text: str, *, all_caps: bool = True,
+                 bookmark: str | None = None) -> None:
     """Заголовок 1 уровня — структурный элемент или глава."""
     page_break(doc)
     p = doc.add_paragraph(style='Heading 1')
-    run = p.add_run(text.upper() if all_caps else text)
+    display = text.upper() if all_caps else text
+    run = p.add_run(display)
     run.bold = True
+    if bookmark:
+        _wrap_with_bookmark(p, bookmark)
     # пустая строка после заголовка
     doc.add_paragraph()
 
 
-def add_heading2(doc: Document, text: str) -> None:
+def add_heading2(doc: Document, text: str, *, bookmark: str | None = None) -> None:
     p = doc.add_paragraph(style='Heading 2')
     p.add_run(text)
+    if bookmark:
+        _wrap_with_bookmark(p, bookmark)
     doc.add_paragraph()  # пустая строка после подзаголовка
 
 
@@ -186,28 +223,123 @@ def add_blank(doc: Document, n: int = 1) -> None:
         p.paragraph_format.first_line_indent = Cm(0)
 
 
-def add_toc(doc: Document) -> None:
-    """Добавляет поле автособираемого оглавления (TOC) по стилям Heading 1/2."""
+def _run_props(*, bold: bool = False) -> OxmlElement:
+    rpr = OxmlElement('w:rPr')
+    rfonts = OxmlElement('w:rFonts')
+    for attr in ('w:ascii', 'w:hAnsi', 'w:cs', 'w:eastAsia'):
+        rfonts.set(qn(attr), 'Times New Roman')
+    rpr.append(rfonts)
+    sz = OxmlElement('w:sz')
+    sz.set(qn('w:val'), '28')  # 14pt
+    rpr.append(sz)
+    if bold:
+        b = OxmlElement('w:b')
+        b.set(qn('w:val'), 'true')
+        rpr.append(b)
+    color = OxmlElement('w:color')
+    color.set(qn('w:val'), '000000')
+    rpr.append(color)
+    return rpr
+
+
+def _add_toc_entry(doc: Document, text: str, bookmark: str, level: int) -> None:
+    """Одна строка оглавления: гиперссылка → закладка + точечная заливка + PAGEREF."""
     p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
     p.paragraph_format.first_line_indent = Cm(0)
-    run = p.add_run()
-    fld1 = OxmlElement('w:fldChar')
-    fld1.set(qn('w:fldCharType'), 'begin')
+    p.paragraph_format.line_spacing = 1.5
+    p.paragraph_format.space_after = Pt(0)
+    p.paragraph_format.space_before = Pt(0)
+    if level == 2:
+        p.paragraph_format.left_indent = Cm(0.75)
+    # Правый табулятор с точечной заливкой на 16 см от левого поля
+    p.paragraph_format.tab_stops.add_tab_stop(
+        Cm(16.0), WD_TAB_ALIGNMENT.RIGHT, WD_TAB_LEADER.DOTS
+    )
+
+    hyperlink = OxmlElement('w:hyperlink')
+    hyperlink.set(qn('w:anchor'), bookmark)
+    hyperlink.set(qn('w:history'), '1')
+
+    # 1) Текст заголовка
+    r_text = OxmlElement('w:r')
+    r_text.append(_run_props(bold=(level == 1)))
+    t = OxmlElement('w:t')
+    t.set(qn('xml:space'), 'preserve')
+    t.text = text
+    r_text.append(t)
+    hyperlink.append(r_text)
+
+    # 2) Табуляция (с точечной заливкой по tab_stop'у)
+    r_tab = OxmlElement('w:r')
+    r_tab.append(_run_props())
+    tab = OxmlElement('w:tab')
+    r_tab.append(tab)
+    hyperlink.append(r_tab)
+
+    # 3) Поле PAGEREF на закладку — реальный номер страницы
+    r_fld_begin = OxmlElement('w:r')
+    r_fld_begin.append(_run_props())
+    fc1 = OxmlElement('w:fldChar')
+    fc1.set(qn('w:fldCharType'), 'begin')
+    fc1.set(qn('w:dirty'), 'true')  # помечаем поле как «грязное» → пересчёт при открытии
+    r_fld_begin.append(fc1)
+    hyperlink.append(r_fld_begin)
+
+    r_instr = OxmlElement('w:r')
+    r_instr.append(_run_props())
     instr = OxmlElement('w:instrText')
     instr.set(qn('xml:space'), 'preserve')
-    instr.text = r'TOC \o "1-2" \h \z \u'
-    fld2 = OxmlElement('w:fldChar')
-    fld2.set(qn('w:fldCharType'), 'separate')
-    placeholder = OxmlElement('w:t')
-    placeholder.text = 'Чтобы обновить оглавление, нажмите правой кнопкой → «Обновить поле».'
-    fld3 = OxmlElement('w:fldChar')
-    fld3.set(qn('w:fldCharType'), 'end')
-    r = run._element
-    r.append(fld1)
-    r.append(instr)
-    r.append(fld2)
-    r.append(placeholder)
-    r.append(fld3)
+    instr.text = f' PAGEREF {bookmark} \\h '
+    r_instr.append(instr)
+    hyperlink.append(r_instr)
+
+    r_sep = OxmlElement('w:r')
+    r_sep.append(_run_props())
+    fc2 = OxmlElement('w:fldChar')
+    fc2.set(qn('w:fldCharType'), 'separate')
+    r_sep.append(fc2)
+    hyperlink.append(r_sep)
+
+    r_placeholder = OxmlElement('w:r')
+    r_placeholder.append(_run_props())
+    tn = OxmlElement('w:t')
+    tn.text = '—'  # отображается до пересчёта поля
+    r_placeholder.append(tn)
+    hyperlink.append(r_placeholder)
+
+    r_fld_end = OxmlElement('w:r')
+    r_fld_end.append(_run_props())
+    fc3 = OxmlElement('w:fldChar')
+    fc3.set(qn('w:fldCharType'), 'end')
+    r_fld_end.append(fc3)
+    hyperlink.append(r_fld_end)
+
+    p._element.append(hyperlink)
+
+
+def _set_update_fields_on_open(doc: Document) -> None:
+    """Принудительная пересборка полей при открытии документа."""
+    settings = doc.settings.element
+    uf = OxmlElement('w:updateFields')
+    uf.set(qn('w:val'), 'true')
+    settings.append(uf)
+
+
+def _collect_toc_entries() -> list[tuple[str, str, int]]:
+    """(текст_в_оглавлении, имя_закладки, уровень)."""
+    items: list[tuple[str, str, int]] = []
+    items.append(('ВВЕДЕНИЕ', 'h_intro', 1))
+    for ch_no, ch_title, sections in CONTENT['chapters']:
+        items.append((f'ГЛАВА {ch_no}. {ch_title.upper()}', f'h_ch{ch_no}', 1))
+        for sec_no, sec_title, _ in sections:
+            items.append((f'{sec_no} {sec_title}',
+                          f'h_sec_{sec_no.replace(".", "_")}', 2))
+    items.append(('ЗАКЛЮЧЕНИЕ', 'h_concl', 1))
+    items.append(('СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ', 'h_sources', 1))
+    for i, (app_title, _) in enumerate(CONTENT['appendices'], 1):
+        items.append((app_title.upper(), f'h_app_{i}', 1))
+    return items
 
 
 def add_table(doc: Document, header: list[str], rows: list[list[str]],
@@ -346,23 +478,35 @@ def build_task_page(doc: Document) -> None:
 
 
 def build_toc(doc: Document) -> None:
-    page_break(doc)
-    p = doc.add_paragraph(style='Heading 1')
-    p.add_run('ОГЛАВЛЕНИЕ')
-    add_blank(doc, 1)
-    add_toc(doc)
+    # Заголовок «ОГЛАВЛЕНИЕ» — по центру, прописными, полужирно
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p.paragraph_format.first_line_indent = Cm(0)
+    p.paragraph_format.line_spacing = 1.0
+    p.paragraph_format.space_after = Pt(12)
+    p.paragraph_format.keep_with_next = True
+    run = p.add_run('ОГЛАВЛЕНИЕ')
+    run.bold = True
+
+    # Статически собранные кликабельные строки оглавления
+    for text, bookmark, level in _collect_toc_entries():
+        _add_toc_entry(doc, text, bookmark, level)
+
+    # Помечаем документ как требующий пересборки полей при открытии
+    _set_update_fields_on_open(doc)
 
 
 def build_introduction(doc: Document) -> None:
-    add_heading1(doc, 'Введение')
+    add_heading1(doc, 'Введение', bookmark='h_intro')
     for par in CONTENT['intro']:
         add_par(doc, par)
 
 
 def build_chapter(doc: Document, ch_no: int, ch_title: str, sections: list[tuple[str, str, list]]) -> None:
-    add_heading1(doc, f'Глава {ch_no}. {ch_title}')
+    add_heading1(doc, f'Глава {ch_no}. {ch_title}', bookmark=f'h_ch{ch_no}')
     for sec_no, sec_title, blocks in sections:
-        add_heading2(doc, f'{sec_no} {sec_title}')
+        add_heading2(doc, f'{sec_no} {sec_title}',
+                     bookmark=f'h_sec_{sec_no.replace(".", "_")}')
         for block in blocks:
             kind = block[0]
             if kind == 'p':
@@ -376,13 +520,13 @@ def build_chapter(doc: Document, ch_no: int, ch_title: str, sections: list[tuple
 
 
 def build_conclusion(doc: Document) -> None:
-    add_heading1(doc, 'Заключение')
+    add_heading1(doc, 'Заключение', bookmark='h_concl')
     for par in CONTENT['conclusion']:
         add_par(doc, par)
 
 
 def build_sources(doc: Document) -> None:
-    add_heading1(doc, 'Список использованных источников')
+    add_heading1(doc, 'Список использованных источников', bookmark='h_sources')
     for section_name, items in CONTENT['sources']:
         add_par(doc, section_name, first_indent=False)
         for i, src in enumerate(items, 1):
@@ -393,8 +537,8 @@ def build_sources(doc: Document) -> None:
 
 
 def build_appendices(doc: Document) -> None:
-    for app_title, paragraphs in CONTENT['appendices']:
-        add_heading1(doc, app_title)
+    for i, (app_title, paragraphs) in enumerate(CONTENT['appendices'], 1):
+        add_heading1(doc, app_title, bookmark=f'h_app_{i}')
         for par in paragraphs:
             if isinstance(par, str):
                 add_par(doc, par)
@@ -413,11 +557,9 @@ def main() -> None:
     set_page_geometry(doc)
     configure_styles(doc)
 
-    # 1. Титульный лист
-    build_title_page(doc)
-    # 2. Задание на ДР
-    build_task_page(doc)
-    # 3. ОГЛАВЛЕНИЕ
+    # По указанию пользователя титульный лист и задание на ДР в файле опущены —
+    # эти страницы готовятся отдельно при сшивке работы (см. п. 11 методических
+    # рекомендаций). Документ начинается сразу с оглавления.
     build_toc(doc)
     # 4. ВВЕДЕНИЕ
     build_introduction(doc)
